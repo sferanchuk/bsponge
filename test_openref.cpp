@@ -256,6 +256,53 @@ int NWAlign(const string &a, const string &b, int alpha_gap, int alpha[alphabets
     return A[n][m];
 }
 
+int CigarAlign(const string &rseq, const string &qseq, const string& cigar, int rbeg, string &r_aligned, string &q_aligned )
+{
+	r_aligned = rseq.substr( 0, rbeg );
+	q_aligned = string( rbeg, '-' );
+	char digits[16];
+	char symb;
+	int npos = 0;
+	int ndigit = 0;
+	int slen = cigar.size();
+	int qbeg = 0;
+	while ( npos < slen )
+	{
+		int symb = cigar[ npos ];
+		if ( symb >= '0' && symb <= '9' )
+		{
+			digits[ ndigit++ ] = symb;
+		}
+		else
+		{
+			digits[ ndigit ] = 0;
+			ndigit = 0;
+			int val = atoi( digits );
+			if ( symb == 'D' || symb == 'N' )
+			{
+				q_aligned += string( val, '-' );
+				r_aligned += rseq.substr( rbeg, val );
+				rbeg += val;
+			}
+			else if ( symb == 'I' )
+			{
+				q_aligned += qseq.substr( qbeg, val );
+				r_aligned += string( val, '-' );
+				qbeg += val;
+			}
+			else if ( symb == 'M' || symb == '=' || symb == 'X' )
+			{
+				q_aligned += qseq.substr( qbeg, val );
+				r_aligned += rseq.substr( rbeg, val );
+				qbeg += val;
+				rbeg += val;
+			}
+		}
+		npos++;
+	}
+	q_aligned += string( int( rseq.size() ) - rbeg, '-' );
+	r_aligned += rseq.substr( rbeg );
+}
 
 bool LoadSeq( FILE *sfile, long pos, string& seq )
 {
@@ -411,7 +458,7 @@ void MergePairs( vector< vector<short> >& ralign, multimap<IPair,IPair>& qpairs,
 			}
 		}
 	}
-	vector<int> begs( nqseqs, 0 );
+	vector<int> begs( nqseqs, -1 );
 	qalignseqs.resize( nqseqs );
 	int bound = 0;
 	for ( int hc = 0; hc < qalign.size(); hc++ )
@@ -428,7 +475,7 @@ void MergePairs( vector< vector<short> >& ralign, multimap<IPair,IPair>& qpairs,
 		{
 			if ( qalign[hc][sc] != -1 )
 			{
-				string sfragm( qseqs[sc], begs[sc], qalign[hc][sc] - begs[sc] );
+				string sfragm( qseqs[sc], begs[sc] + 1, qalign[hc][sc] - begs[sc] );
 				for ( int pc = 0; pc < int( sfragm.size() ) - 1; pc++ ) sfragm[pc] = tolower( sfragm[pc] );
 				int gsize = ( gmax - qalignseqs[sc].size()  - sfragm.size() );
 				sfragm.insert( 0, gsize, '-' );
@@ -442,11 +489,11 @@ void MergePairs( vector< vector<short> >& ralign, multimap<IPair,IPair>& qpairs,
 		int gmax = 0;
 		for ( int sc = 0; sc < nqseqs; sc++ )
 		{
-				gmax = max( gmax, bound + int( qseqs[sc].size() ) - begs[sc] );
+				gmax = max( gmax, bound + int( qseqs[sc].size() ) - begs[sc] - 1 );
 		}
 		for ( int sc = 0; sc < nqseqs; sc++ )
 		{
-			string sfragm( qseqs[sc], begs[sc] );
+			string sfragm( qseqs[sc], begs[sc] + 1 );
 			for ( int pc = 1; pc < int( sfragm.size() ); pc++ ) sfragm[pc] = tolower( sfragm[pc] );
 			int gsize = ( gmax - qalignseqs[sc].size()  - sfragm.size() );
 			sfragm.append( gsize, '-' );
@@ -514,9 +561,16 @@ bool RefData::LoadRefs( const char *filename, const char *kwstr )
 	return true;
 }
 
+struct SamAlign
+{
+	string ref;
+	int beg;
+	string cigar;
+};
+
 struct SamData : RefData
 {
-	map<string,string> smap;
+	map<string,SamAlign> smap;
 	map<string, map<int, set<string> > > otusets;
 	set<string> rcreads;
 	map<string,IPair> otubounds;
@@ -524,7 +578,7 @@ struct SamData : RefData
 	bool LoadSamGen( const char *lname );
 };
 
-IPair parse_cigar( int ref_pos, const char *cigar )
+IPair parse_cigar( int ref_pos, const char *cigar, string& cleancigar )
 {
 	char digits[16];
 	char symb;
@@ -534,6 +588,8 @@ IPair parse_cigar( int ref_pos, const char *cigar )
 	bool first = true;
 	int beg = 0;
 	int length = 0;
+	int cbpos = 0;
+	int cepos = 0;
 	while ( npos < slen )
 	{
 		int symb = cigar[ npos ];
@@ -548,18 +604,28 @@ IPair parse_cigar( int ref_pos, const char *cigar )
 			int val = atoi( digits );
 			if ( symb == 'D' || symb == 'N' )
 			{
-				if ( first ) beg = val;
+				if ( first ) 
+				{
+					beg = val;
+					cbpos = npos + 1;
+				}
 				else if ( npos + 1 == slen ) break;
-				else length += val;
+				else 
+				{
+					length += val;
+					cepos = npos;
+				}
 			}
 			else if ( symb == 'M' || symb == '=' || symb == 'X' )
 			{
 				length += val;
+				cepos = npos;
 			}
 			first = false;
 		}
 		npos++;
 	}
+	cleancigar = string( cigar + cbpos, 0, cepos - cbpos + 1 );
 	return IPair( beg + ref_pos - 1, beg + length + ref_pos - 1 );
 	
 }
@@ -583,12 +649,17 @@ bool SamData::LoadSam( const char *sname )
 		int flag = atoi( fields[1].data() );
 		int ref_pos = atoi( fields[3].data() );
 		string& cigar = fields[5];
-		IPair cbounds = parse_cigar( ref_pos, cigar.data() );
+		string cleancigar;
+		IPair cbounds = parse_cigar( ref_pos, cigar.data(), cleancigar );
 		if ( index.find( ref_id ) != index.end() ) 
 		{
 			int ref_ind = index[ ref_id ];
 			string otuname = otu[ ref_ind ];
-			smap[ read_id ] = ref_id;
+			SamAlign ca;
+			ca.ref = ref_id;
+			ca.beg = cbounds.first;
+			ca.cigar = cleancigar;
+			smap[ read_id ] = ca;
 			otusets[ otuname ][ ref_ind ].insert( read_id );
 			if ( flag & 16 ) rcreads.insert( read_id );
 			if ( otubounds.find( otuname ) == otubounds.end() )
@@ -633,7 +704,7 @@ bool SamData::LoadSamGen( const char *lname )
 		LoadSam( buf );
 	}
 	fclose( lfile );
-	fprintf( stderr, "sam import done, %d motifs, %d otusets\n", int( smap.size() ), int( otusets.size() ) );
+	fprintf( stderr, "sam import done, %d motifs, %d otusets, %d rcreads\n", int( smap.size() ), int( otusets.size() ), int( rcreads.size() ) );
 	fflush( stderr );
 	return true;
 }
@@ -867,6 +938,7 @@ bool MainClass::SingleRefs( const string& cotu )
 	for ( int cc = 0; cc < cl_index.size(); cc++ )
 	{
 		cref_center[ cc ] = *( cl_index[cc].begin() );
+		cref_index[ *( cl_index[cc].begin() ) ] = cc;
 	}
 	int bounds = 20;
 	int rbeg = otubounds[ cotu ].first;
@@ -882,7 +954,7 @@ bool MainClass::SingleRefs( const string& cotu )
 			vector<short> spos( 1, lc - abeg );
 			cref_aligns[cc].push_back( spos );
 		}
-		cref_seqs[cc][cc] = rseqs[cc].substr( abeg, aend - abeg + 1 );
+		cref_seqs[cc][cc] = rseqs[cc].substr( abeg, aend - abeg + 2 );
 	}
 	return true;
 }
@@ -964,7 +1036,8 @@ bool MainClass::ProcessReads( const string& cotu, double threshold, int clmethod
 			string qalign;
 			string salign;
 			string& sseq = cref_seqs[cluster][seqc];
-			int al_res = NWAlign( rseq, sseq, gap_penalty, alpha, qalign, salign );
+			//int al_res = NWAlign( rseq, sseq, gap_penalty, alpha, qalign, salign );
+			CigarAlign( sseq, rseq, smap[ *it ].cigar, smap[ *it ].beg - otubounds[ cotu ].first, salign, qalign );
 			int nseq = rseqs[ cluster ].size();
 			rseqs[ cluster ].push_back( rseq );
 			rsamples[ cluster ].push_back( sfname );
@@ -988,6 +1061,7 @@ bool MainClass::ProcessReads( const string& cotu, double threshold, int clmethod
 					b2++;
 				}
 			}
+			//fprintf( stderr, "%s\n%s\nident %d qseq %d sseq %d al_res %d read %s bounds %d %d\n", qalign.data(), salign.data(), nident, int( rseq.size() ), int( sseq.size() ), rcreads.find( *it ) != rcreads.end() ? 1 : 0, it->data(), otubounds[ cotu ].first, otubounds[ cotu ].second );
 			rscores[ cluster ].push_back( double( nident ) / rseq.size() ); 
 		}
 		for ( int cc = 0; cc < cref_seqs.size(); cc++ )
@@ -1043,7 +1117,8 @@ bool MainClass::ProcessReads( const string& cotu, double threshold, int clmethod
 				for ( set<int>::iterator it = cl_index[c2c].begin(); it != cl_index[c2c].end(); it++ )
 				{
 					int sc = *it;
-					fprintf( of_reads, ">%s %s %s %d_%d_%4.1f %4.1f\n%s\n", rids[cc][sc].data(), rsamples[cc][sc].data(), cotu.data(), otucl, rcl, pident, 100. * rscores[cc][sc], rseqs[cc][sc].data() );
+//					fprintf( of_reads, ">%s %s %s %d_%d_%4.1f %4.1f\n%s\n", rids[cc][sc].data(), rsamples[cc][sc].data(), cotu.data(), otucl, rcl, pident, 100. * rscores[cc][sc], rseqs[cc][sc].data() );
+					fprintf( of_reads, ">%s %s %s %d_%d_%4.1f %4.1f\n%s\n", rids[cc][sc].data(), rsamples[cc][sc].data(), cotu.data(), otucl, rcl, pident, 100. * rscores[cc][sc], ralignseqs[sc].data() );
 					emap[ emkey ][ rsamples[cc][sc] ]++;
 				}
 			}
@@ -1068,7 +1143,7 @@ int main( int argc, char **argv )
 	const char *of2_name = argv[5];
 	const char *kwstr = 0;
 	double thresh1 = 0.6;
-	double thresh2 = 0.3;
+	double thresh2 = 0.03;
 	int clmethod1 = clComplete;
 	int clmethod2 = clComplete;
 	int maxgsize = 500;
